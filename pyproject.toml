@@ -25,7 +25,7 @@ dev = [
 addopts = "--cov=. --cov-report=term-missing"
 
 [tool.coverage.run]
-omit = ["tests/*", ".venv/*"]
+omit = ["tests/*", ".venv/*", "scripts/*"]
 
 [tool.coverage.report]
 exclude_lines = [

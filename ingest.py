@@ -173,19 +173,14 @@ def ingest_file(
             "total_chunks": len(chunks),
         }
 
-        # Add frontmatter fields if present
-        if "title" in metadata:
-            chunk_metadata["title"] = metadata["title"]
-        if "date" in metadata:
-            # Convert date to string if it's a date object
-            chunk_metadata["date"] = str(metadata["date"])
-        if "tags" in metadata:
-            # ChromaDB doesn't support list metadata, so join tags
-            tags = metadata["tags"]
-            if isinstance(tags, list):
-                chunk_metadata["tags"] = ", ".join(str(t) for t in tags)
+        # Add all frontmatter fields
+        for key, value in metadata.items():
+            if isinstance(value, list):
+                # ChromaDB doesn't support list metadata, so join as comma-separated
+                chunk_metadata[key] = ", ".join(str(v) for v in value)
             else:
-                chunk_metadata["tags"] = str(tags)
+                # Convert to string to handle dates, numbers, etc.
+                chunk_metadata[key] = str(value)
 
         metadatas.append(chunk_metadata)
 
