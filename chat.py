@@ -16,7 +16,9 @@ from rich.table import Table
 from rich.theme import Theme
 
 from chroma_client import get_chroma_client
+from dotenv import load_dotenv
 
+load_dotenv()
 # Custom theme for the chat
 custom_theme = Theme(
     {
@@ -466,7 +468,7 @@ def chat_with_anthropic(
 @app.command()
 def chat(
     collection: str = typer.Option(
-        "blog_posts",
+        "ac_articles",
         "--collection",
         "-c",
         help="ChromaDB collection name to query",

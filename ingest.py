@@ -7,7 +7,9 @@ from pathlib import Path
 import frontmatter
 
 from chroma_client import get_chroma_client
+from dotenv import load_dotenv
 
+load_dotenv()
 
 
 from tokenizers import Tokenizer
