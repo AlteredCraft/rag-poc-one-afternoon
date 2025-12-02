@@ -14,6 +14,9 @@ wheels/
 # ChromaDB
 .chromadb
 
+# Environment variables (keep dist.env as template)
+.env
+
 # MacOS
 .DS_Store
 
