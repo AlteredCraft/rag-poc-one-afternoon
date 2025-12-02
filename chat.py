@@ -3,6 +3,7 @@
 
 import os
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import anthropic
 import typer
@@ -37,6 +38,40 @@ app = typer.Typer(
 )
 
 
+# --- Protocols for Dependency Injection ---
+
+
+class CollectionProtocol(Protocol):
+    """Protocol for ChromaDB collection."""
+
+    def query(
+        self,
+        query_texts: list[str],
+        n_results: int,
+        where: dict | None,
+        include: list[str],
+    ) -> dict: ...
+
+
+class ChromaClientProtocol(Protocol):
+    """Protocol for ChromaDB client."""
+
+    def get_collection(self, name: str) -> CollectionProtocol: ...
+
+
+class AnthropicClientProtocol(Protocol):
+    """Protocol for Anthropic client."""
+
+    class Messages:
+        def stream(self, **kwargs): ...
+
+    @property
+    def messages(self) -> Messages: ...
+
+
+# --- Data Classes ---
+
+
 @dataclass
 class RAGConfig:
     """Configuration for RAG retrieval."""
@@ -58,156 +93,118 @@ class ChatContext:
     last_sources: list[dict] = field(default_factory=list)
 
 
-def print_banner():
-    """Print a stylish welcome banner."""
-    banner = r"""
-[bold magenta]  ____      _    ____    ____ _           _   [/]
-[bold magenta] |  _ \    / \  / ___|  / ___| |__   __ _| |_ [/]
-[bold magenta] | |_) |  / _ \| |  _  | |   | '_ \ / _` | __|[/]
-[bold magenta] |  _ <  / ___ \ |_| | | |___| | | | (_| | |_ [/]
-[bold magenta] |_| \_\/_/   \_\____|  \____|_| |_|\__,_|\__|[/]
-    """
-    console.print(banner)
-    console.print(
-        Panel(
-            "[info]Chat with your knowledge base using AI-powered retrieval[/]\n\n"
-            "[dim]Commands:[/]\n"
-            "  [bold]/help[/]     - Show all commands\n"
-            "  [bold]/config[/]   - Show current RAG settings\n"
-            "  [bold]/sources[/]  - Show sources from last response\n"
-            "  [bold]/clear[/]    - Clear chat history\n"
-            "  [bold]/quit[/]     - Exit the chat",
-            title="[bold]Welcome to RAG Chat[/]",
-            border_style="magenta",
-        )
-    )
+@dataclass
+class QueryResult:
+    """Result from a ChromaDB query."""
+
+    documents: list[str]
+    metadatas: list[dict]
 
 
-def print_help():
-    """Print help information."""
-    table = Table(title="Available Commands", border_style="cyan")
-    table.add_column("Command", style="bold")
-    table.add_column("Description")
-
-    commands = [
-        ("/help", "Show this help message"),
-        ("/config", "Display current RAG configuration"),
-        ("/sources", "Show sources used in the last response"),
-        ("/set <option> <value>", "Change a RAG setting"),
-        ("/clear", "Clear conversation history"),
-        ("/quit, /exit, /q", "Exit the chat"),
-    ]
-
-    for cmd, desc in commands:
-        table.add_row(cmd, desc)
-
-    console.print(table)
-
-    # Config options
-    console.print("\n[bold]RAG Configuration Options (/set):[/]")
-    config_table = Table(border_style="dim")
-    config_table.add_column("Option", style="bold")
-    config_table.add_column("Type")
-    config_table.add_column("Description")
-
-    options = [
-        ("n_results", "int", "Number of documents to retrieve (default: 5)"),
-        ("min_relevance", "float", "Minimum similarity score 0-1 (default: none)"),
-        ("filter_type", "str", "Filter by document type (e.g., deep_dive, weekly_review)"),
-        ("filter_author", "str", "Filter by author name"),
-        ("include_sources", "bool", "Show source references (default: true)"),
-    ]
-
-    for opt, typ, desc in options:
-        config_table.add_row(opt, typ, desc)
-
-    console.print(config_table)
+# --- Core Service Classes with DI ---
 
 
-def print_config(config: RAGConfig):
-    """Display current RAG configuration."""
-    table = Table(title="Current RAG Configuration", border_style="cyan")
-    table.add_column("Setting", style="bold")
-    table.add_column("Value")
+class RAGService:
+    """Service for RAG retrieval operations."""
 
-    table.add_row("n_results", str(config.n_results))
-    table.add_row("min_relevance", str(config.min_relevance) if config.min_relevance else "none")
-    table.add_row("filter_type", config.filter_type or "none")
-    table.add_row("filter_author", config.filter_author or "none")
-    table.add_row("include_sources", str(config.include_sources).lower())
+    def __init__(self, chroma_client: ChromaClientProtocol):
+        self.chroma_client = chroma_client
 
-    console.print(table)
+    def query(
+        self,
+        query_text: str,
+        collection_name: str,
+        config: RAGConfig,
+    ) -> QueryResult:
+        """Query ChromaDB for relevant documents."""
+        try:
+            collection = self.chroma_client.get_collection(collection_name)
+        except Exception:
+            return QueryResult(documents=[], metadatas=[])
 
+        # Build where filter
+        where_filter = build_where_filter(config)
 
-def print_sources(sources: list[dict]):
-    """Display sources from the last response."""
-    if not sources:
-        console.print("[warning]No sources available. Ask a question first![/]")
-        return
-
-    table = Table(title="Sources Used", border_style="cyan")
-    table.add_column("#", style="dim", width=3)
-    table.add_column("Source", style="bold")
-    table.add_column("Title")
-    table.add_column("Type", style="dim")
-
-    for i, src in enumerate(sources, 1):
-        table.add_row(
-            str(i),
-            src.get("source_file", "unknown"),
-            src.get("title", "untitled")[:40],
-            src.get("type", ""),
+        # Query the collection
+        results = collection.query(
+            query_texts=[query_text],
+            n_results=config.n_results,
+            where=where_filter,
+            include=["documents", "metadatas", "distances"],
         )
 
-    console.print(table)
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        # Filter by relevance if specified
+        if config.min_relevance is not None:
+            documents, metadatas = filter_by_relevance(
+                documents, metadatas, distances, config.min_relevance
+            )
+
+        return QueryResult(documents=documents, metadatas=metadatas)
 
 
-def handle_set_command(args: list[str], config: RAGConfig) -> bool:
-    """Handle /set command to update configuration."""
-    if len(args) < 2:
-        console.print("[error]Usage: /set <option> <value>[/]")
-        return False
+class ChatService:
+    """Service for chat operations with Anthropic."""
 
-    option, value = args[0].lower(), args[1]
+    DEFAULT_SYSTEM_PROMPT = """You are a helpful assistant that answers questions based on the provided context from a knowledge base.
 
-    try:
-        if option == "n_results":
-            config.n_results = max(1, int(value))
-        elif option == "min_relevance":
-            if value.lower() == "none":
-                config.min_relevance = None
-            else:
-                config.min_relevance = max(0.0, min(1.0, float(value)))
-        elif option == "filter_type":
-            config.filter_type = None if value.lower() == "none" else value
-        elif option == "filter_author":
-            config.filter_author = None if value.lower() == "none" else value
-        elif option == "include_sources":
-            config.include_sources = value.lower() in ("true", "1", "yes")
-        else:
-            console.print(f"[error]Unknown option: {option}[/]")
-            return False
+When answering:
+- Use the provided context to give accurate, relevant answers
+- If the context doesn't contain enough information, say so clearly
+- Be concise but thorough
+- Reference specific sources when relevant
+- If you're unsure, express uncertainty rather than making things up"""
 
-        console.print(f"[success]Set {option} = {value}[/]")
-        return True
-    except ValueError as e:
-        console.print(f"[error]Invalid value: {e}[/]")
-        return False
+    def __init__(self, anthropic_client: AnthropicClientProtocol):
+        self.anthropic_client = anthropic_client
+
+    def chat(
+        self,
+        query: str,
+        context: str,
+        history: list[dict],
+        model: str = "claude-sonnet-4-20250514",
+        console: Console | None = None,
+    ) -> str:
+        """Send a message to Anthropic and get a response."""
+        system_prompt = self.DEFAULT_SYSTEM_PROMPT
+        if context:
+            system_prompt += f"\n\n{context}"
+
+        messages = history + [{"role": "user", "content": query}]
+
+        # Stream the response
+        full_response = ""
+        output_console = console or Console()
+
+        with Live(console=output_console, refresh_per_second=10) as live:
+            with self.anthropic_client.messages.stream(
+                model=model,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    full_response += text
+                    live.update(
+                        Panel(
+                            Markdown(full_response),
+                            title="[assistant]Assistant[/]",
+                            border_style="magenta",
+                        )
+                    )
+
+        return full_response
 
 
-def query_chromadb(query: str, collection_name: str, config: RAGConfig) -> tuple[list[str], list[dict]]:
-    """Query ChromaDB for relevant documents."""
-    client = get_chroma_client()
+# --- Pure Helper Functions ---
 
-    try:
-        collection = client.get_collection(collection_name)
-    except Exception:
-        console.print(f"[error]Collection '{collection_name}' not found![/]")
-        console.print("[info]Run 'uv run python ingest.py <directory>' to ingest documents first.[/]")
-        return [], []
 
-    # Build where filter
-    where_filter = None
+def build_where_filter(config: RAGConfig) -> dict | None:
+    """Build ChromaDB where filter from config."""
     conditions = []
 
     if config.filter_type:
@@ -215,38 +212,33 @@ def query_chromadb(query: str, collection_name: str, config: RAGConfig) -> tuple
     if config.filter_author:
         conditions.append({"author": config.filter_author})
 
-    if len(conditions) == 1:
-        where_filter = conditions[0]
-    elif len(conditions) > 1:
-        where_filter = {"$and": conditions}
+    if len(conditions) == 0:
+        return None
+    elif len(conditions) == 1:
+        return conditions[0]
+    else:
+        return {"$and": conditions}
 
-    # Query the collection
-    results = collection.query(
-        query_texts=[query],
-        n_results=config.n_results,
-        where=where_filter,
-        include=["documents", "metadatas", "distances"],
-    )
 
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
+def filter_by_relevance(
+    documents: list[str],
+    metadatas: list[dict],
+    distances: list[float],
+    min_relevance: float,
+) -> tuple[list[str], list[dict]]:
+    """Filter documents by minimum relevance score."""
+    filtered_docs = []
+    filtered_meta = []
 
-    # Filter by relevance if specified
-    if config.min_relevance is not None:
-        filtered_docs = []
-        filtered_meta = []
-        for doc, meta, dist in zip(documents, metadatas, distances):
-            # ChromaDB returns L2 distance; convert to similarity
-            # Lower distance = higher similarity
-            similarity = 1 / (1 + dist)
-            if similarity >= config.min_relevance:
-                filtered_docs.append(doc)
-                filtered_meta.append(meta)
-        documents = filtered_docs
-        metadatas = filtered_meta
+    for doc, meta, dist in zip(documents, metadatas, distances):
+        # ChromaDB returns L2 distance; convert to similarity
+        # Lower distance = higher similarity
+        similarity = 1 / (1 + dist)
+        if similarity >= min_relevance:
+            filtered_docs.append(doc)
+            filtered_meta.append(meta)
 
-    return documents, metadatas
+    return filtered_docs, filtered_meta
 
 
 def build_context_prompt(documents: list[str], metadatas: list[dict]) -> str:
@@ -266,49 +258,209 @@ def build_context_prompt(documents: list[str], metadatas: list[dict]) -> str:
     return "\n".join(context_parts)
 
 
+# --- UI Functions ---
+
+
+def print_banner(output_console: Console | None = None):
+    """Print a stylish welcome banner."""
+    c = output_console or console
+    banner = r"""
+[bold magenta]  ____      _    ____    ____ _           _   [/]
+[bold magenta] |  _ \    / \  / ___|  / ___| |__   __ _| |_ [/]
+[bold magenta] | |_) |  / _ \| |  _  | |   | '_ \ / _` | __|[/]
+[bold magenta] |  _ <  / ___ \ |_| | | |___| | | | (_| | |_ [/]
+[bold magenta] |_| \_\/_/   \_\____|  \____|_| |_|\__,_|\__|[/]
+    """
+    c.print(banner)
+    c.print(
+        Panel(
+            "[info]Chat with your knowledge base using AI-powered retrieval[/]\n\n"
+            "[dim]Commands:[/]\n"
+            "  [bold]/help[/]     - Show all commands\n"
+            "  [bold]/config[/]   - Show current RAG settings\n"
+            "  [bold]/sources[/]  - Show sources from last response\n"
+            "  [bold]/clear[/]    - Clear chat history\n"
+            "  [bold]/quit[/]     - Exit the chat",
+            title="[bold]Welcome to RAG Chat[/]",
+            border_style="magenta",
+        )
+    )
+
+
+def print_help(output_console: Console | None = None):
+    """Print help information."""
+    c = output_console or console
+    table = Table(title="Available Commands", border_style="cyan")
+    table.add_column("Command", style="bold")
+    table.add_column("Description")
+
+    commands = [
+        ("/help", "Show this help message"),
+        ("/config", "Display current RAG configuration"),
+        ("/sources", "Show sources used in the last response"),
+        ("/set <option> <value>", "Change a RAG setting"),
+        ("/clear", "Clear conversation history"),
+        ("/quit, /exit, /q", "Exit the chat"),
+    ]
+
+    for cmd, desc in commands:
+        table.add_row(cmd, desc)
+
+    c.print(table)
+
+    # Config options
+    c.print("\n[bold]RAG Configuration Options (/set):[/]")
+    config_table = Table(border_style="dim")
+    config_table.add_column("Option", style="bold")
+    config_table.add_column("Type")
+    config_table.add_column("Description")
+
+    options = [
+        ("n_results", "int", "Number of documents to retrieve (default: 5)"),
+        ("min_relevance", "float", "Minimum similarity score 0-1 (default: none)"),
+        ("filter_type", "str", "Filter by document type (e.g., deep_dive, weekly_review)"),
+        ("filter_author", "str", "Filter by author name"),
+        ("include_sources", "bool", "Show source references (default: true)"),
+    ]
+
+    for opt, typ, desc in options:
+        config_table.add_row(opt, typ, desc)
+
+    c.print(config_table)
+
+
+def print_config(config: RAGConfig, output_console: Console | None = None):
+    """Display current RAG configuration."""
+    c = output_console or console
+    table = Table(title="Current RAG Configuration", border_style="cyan")
+    table.add_column("Setting", style="bold")
+    table.add_column("Value")
+
+    table.add_row("n_results", str(config.n_results))
+    table.add_row("min_relevance", str(config.min_relevance) if config.min_relevance else "none")
+    table.add_row("filter_type", config.filter_type or "none")
+    table.add_row("filter_author", config.filter_author or "none")
+    table.add_row("include_sources", str(config.include_sources).lower())
+
+    c.print(table)
+
+
+def print_sources(sources: list[dict], output_console: Console | None = None):
+    """Display sources from the last response."""
+    c = output_console or console
+    if not sources:
+        c.print("[warning]No sources available. Ask a question first![/]")
+        return
+
+    table = Table(title="Sources Used", border_style="cyan")
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Source", style="bold")
+    table.add_column("Title")
+    table.add_column("Type", style="dim")
+
+    for i, src in enumerate(sources, 1):
+        table.add_row(
+            str(i),
+            src.get("source_file", "unknown"),
+            src.get("title", "untitled")[:40],
+            src.get("type", ""),
+        )
+
+    c.print(table)
+
+
+def handle_set_command(
+    args: list[str],
+    config: RAGConfig,
+    output_console: Console | None = None,
+) -> bool:
+    """Handle /set command to update configuration."""
+    c = output_console or console
+
+    if len(args) < 2:
+        c.print("[error]Usage: /set <option> <value>[/]")
+        return False
+
+    option, value = args[0].lower(), args[1]
+
+    try:
+        if option == "n_results":
+            config.n_results = max(1, int(value))
+        elif option == "min_relevance":
+            if value.lower() == "none":
+                config.min_relevance = None
+            else:
+                config.min_relevance = max(0.0, min(1.0, float(value)))
+        elif option == "filter_type":
+            config.filter_type = None if value.lower() == "none" else value
+        elif option == "filter_author":
+            config.filter_author = None if value.lower() == "none" else value
+        elif option == "include_sources":
+            config.include_sources = value.lower() in ("true", "1", "yes")
+        else:
+            c.print(f"[error]Unknown option: {option}[/]")
+            return False
+
+        c.print(f"[success]Set {option} = {value}[/]")
+        return True
+    except ValueError as e:
+        c.print(f"[error]Invalid value: {e}[/]")
+        return False
+
+
+# --- Legacy wrapper for backwards compatibility ---
+
+
+def query_chromadb(
+    query: str,
+    collection_name: str,
+    config: RAGConfig,
+    chroma_client: ChromaClientProtocol | None = None,
+) -> tuple[list[str], list[dict]]:
+    """Query ChromaDB for relevant documents.
+
+    Args:
+        query: The search query
+        collection_name: Name of the ChromaDB collection
+        config: RAG configuration
+        chroma_client: Optional ChromaDB client (for DI). If None, creates default client.
+
+    Returns:
+        Tuple of (documents, metadatas)
+    """
+    client = chroma_client or get_chroma_client()
+    service = RAGService(client)
+    result = service.query(query, collection_name, config)
+    return result.documents, result.metadatas
+
+
 def chat_with_anthropic(
     query: str,
     context: str,
     history: list[dict],
     model: str = "claude-sonnet-4-20250514",
+    anthropic_client: AnthropicClientProtocol | None = None,
+    output_console: Console | None = None,
 ) -> str:
-    """Send a message to Anthropic and get a response."""
-    client = anthropic.Anthropic()
+    """Send a message to Anthropic and get a response.
 
-    system_prompt = """You are a helpful assistant that answers questions based on the provided context from a knowledge base.
+    Args:
+        query: User's question
+        context: RAG context string
+        history: Conversation history
+        model: Anthropic model to use
+        anthropic_client: Optional Anthropic client (for DI). If None, creates default client.
+        output_console: Optional console for output (for DI/testing).
 
-When answering:
-- Use the provided context to give accurate, relevant answers
-- If the context doesn't contain enough information, say so clearly
-- Be concise but thorough
-- Reference specific sources when relevant
-- If you're unsure, express uncertainty rather than making things up"""
+    Returns:
+        The assistant's response
+    """
+    client = anthropic_client or anthropic.Anthropic()
+    service = ChatService(client)
+    return service.chat(query, context, history, model, output_console)
 
-    if context:
-        system_prompt += f"\n\n{context}"
 
-    messages = history + [{"role": "user", "content": query}]
-
-    # Stream the response
-    full_response = ""
-    with Live(console=console, refresh_per_second=10) as live:
-        with client.messages.stream(
-            model=model,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=messages,
-        ) as stream:
-            for text in stream.text_stream:
-                full_response += text
-                live.update(
-                    Panel(
-                        Markdown(full_response),
-                        title="[assistant]Assistant[/]",
-                        border_style="magenta",
-                    )
-                )
-
-    return full_response
+# --- CLI Commands ---
 
 
 @app.command()
