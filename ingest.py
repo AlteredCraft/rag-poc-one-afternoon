@@ -7,7 +7,9 @@ from pathlib import Path
 import frontmatter
 
 from chroma_client import get_chroma_client
+from dotenv import load_dotenv
 
+load_dotenv()
 
 
 from tokenizers import Tokenizer
@@ -91,29 +93,44 @@ def chunk_by_tokens(content: str, max_tokens: int = 256, stride: int = 50) -> li
     if not TOKENIZER:
         # Fallback: return entire content as one chunk
         return [content.strip()] if content.strip() else []
-    
+
     if not content.strip():
         return []
-    
+
     # Create a chunking tokenizer with truncation enabled
     chunking_tokenizer = Tokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
     chunking_tokenizer.enable_truncation(max_length=max_tokens, stride=stride, strategy="longest_first")
     chunking_tokenizer.no_padding()
-    
+
     # Encode with overflowing tokens
     encoded = chunking_tokenizer.encode(content)
-    
-    # Collect all chunks: main encoding + overflowing
+
+    # Collect all chunks using character offsets from the original text
+    # This preserves the original formatting instead of reconstructing from tokens
     chunks = []
-    
+
+    def extract_chunk_text(encoding) -> str:
+        """Extract original text using token offsets."""
+        offsets = encoding.offsets
+        # Filter out special tokens (they have (0, 0) offsets)
+        valid_offsets = [(start, end) for start, end in offsets if start != end]
+        if not valid_offsets:
+            return ""
+        start_char = valid_offsets[0][0]
+        end_char = valid_offsets[-1][1]
+        return content[start_char:end_char].strip()
+
     # First chunk
-    chunks.append(chunking_tokenizer.decode(encoded.ids, skip_special_tokens=True))
-    
+    chunk_text = extract_chunk_text(encoded)
+    if chunk_text:
+        chunks.append(chunk_text)
+
     # Overflowing chunks
     for overflow_encoding in encoded.overflowing:
-        chunk_text = chunking_tokenizer.decode(overflow_encoding.ids, skip_special_tokens=True)
-        chunks.append(chunk_text)
-    
+        chunk_text = extract_chunk_text(overflow_encoding)
+        if chunk_text:
+            chunks.append(chunk_text)
+
     return chunks
 
 
@@ -173,19 +190,14 @@ def ingest_file(
             "total_chunks": len(chunks),
         }
 
-        # Add frontmatter fields if present
-        if "title" in metadata:
-            chunk_metadata["title"] = metadata["title"]
-        if "date" in metadata:
-            # Convert date to string if it's a date object
-            chunk_metadata["date"] = str(metadata["date"])
-        if "tags" in metadata:
-            # ChromaDB doesn't support list metadata, so join tags
-            tags = metadata["tags"]
-            if isinstance(tags, list):
-                chunk_metadata["tags"] = ", ".join(str(t) for t in tags)
+        # Add all frontmatter fields
+        for key, value in metadata.items():
+            if isinstance(value, list):
+                # ChromaDB doesn't support list metadata, so join as comma-separated
+                chunk_metadata[key] = ", ".join(str(v) for v in value)
             else:
-                chunk_metadata["tags"] = str(tags)
+                # Convert to string to handle dates, numbers, etc.
+                chunk_metadata[key] = str(value)
 
         metadatas.append(chunk_metadata)
 
@@ -198,16 +210,19 @@ def ingest_file(
 def ingest_directory(
     directory: str | Path,
     collection_name: str = "blog_posts",
-    persist_path: str = "./.chromadb",
     no_chunk: bool = False,
 ) -> dict:
     """
     Ingest all markdown files from a directory into ChromaDB.
 
+    Client configuration is read from environment variables:
+        - CHROMA_CLIENT_TYPE: "persistent" (default) or "cloud"
+        - CHROMA_PERSIST_PATH: Local storage path (for persistent mode)
+        - CHROMA_TENANT, CHROMA_DATABASE, CHROMA_API_KEY: Cloud credentials
+
     Args:
         directory: Path to the directory containing markdown files
         collection_name: Name of the ChromaDB collection to use
-        persist_path: Path for ChromaDB persistent storage
         no_chunk: If True, ingest entire documents without chunking
 
     Returns:
@@ -218,8 +233,8 @@ def ingest_directory(
     if not directory.exists():
         raise FileNotFoundError(f"Directory not found: {directory}")
 
-    # Get the ChromaDB client and collection
-    client = get_chroma_client(persist_path=persist_path)
+    # Get the ChromaDB client and collection (config from env vars)
+    client = get_chroma_client()
     collection = client.get_or_create_collection(name=collection_name)
 
     # Find all markdown files

@@ -12,7 +12,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 class TestFindMarkdownFiles:
     def test_finds_all_md_files(self):
         files = find_markdown_files(FIXTURES_DIR)
-        assert len(files) == 5  # Updated: now includes test_document.md
+        assert len(files) == 6
         names = {f.name for f in files}
         assert "simple.md" in names
         assert "with_sections.md" in names
@@ -135,15 +135,15 @@ More content."""
 
 
 class TestIngestDirectory:
-    def test_ingests_fixtures(self, tmp_path):
-        # Use a temporary chromadb path
+    def test_ingests_fixtures(self, tmp_path, monkeypatch):
+        # Use a temporary chromadb path via env var
         persist_path = str(tmp_path / ".chromadb")
+        monkeypatch.setenv("CHROMA_PERSIST_PATH", persist_path)
         result = ingest_directory(
             FIXTURES_DIR,
             collection_name="test_collection",
-            persist_path=persist_path,
         )
-        assert result["files_processed"] == 5  # Updated: now includes test_document.md
+        assert result["files_processed"] == 6
         assert result["chunks_added"] > 0
         assert result["collection_name"] == "test_collection"
 
@@ -151,31 +151,31 @@ class TestIngestDirectory:
         with pytest.raises(FileNotFoundError):
             ingest_directory(tmp_path / "nonexistent")
 
-    def test_empty_directory(self, tmp_path):
+    def test_empty_directory(self, tmp_path, monkeypatch):
         persist_path = str(tmp_path / ".chromadb")
+        monkeypatch.setenv("CHROMA_PERSIST_PATH", persist_path)
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
 
         result = ingest_directory(
             empty_dir,
             collection_name="empty_test",
-            persist_path=persist_path,
         )
         assert result["files_processed"] == 0
         assert result["chunks_added"] == 0
 
-    def test_creates_searchable_collection(self, tmp_path):
+    def test_creates_searchable_collection(self, tmp_path, monkeypatch):
         from chroma_client import get_chroma_client
 
         persist_path = str(tmp_path / ".chromadb")
+        monkeypatch.setenv("CHROMA_PERSIST_PATH", persist_path)
         ingest_directory(
             FIXTURES_DIR,
             collection_name="search_test",
-            persist_path=persist_path,
         )
 
         # Query the collection
-        client = get_chroma_client(persist_path=persist_path)
+        client = get_chroma_client()
         collection = client.get_collection("search_test")
 
         results = collection.query(
@@ -185,17 +185,17 @@ class TestIngestDirectory:
         assert len(results["documents"][0]) == 1
         assert results["metadatas"][0][0]["source_file"] is not None
 
-    def test_metadata_stored_correctly(self, tmp_path):
+    def test_metadata_stored_correctly(self, tmp_path, monkeypatch):
         from chroma_client import get_chroma_client
 
         persist_path = str(tmp_path / ".chromadb")
+        monkeypatch.setenv("CHROMA_PERSIST_PATH", persist_path)
         ingest_directory(
             FIXTURES_DIR,
             collection_name="metadata_test",
-            persist_path=persist_path,
         )
 
-        client = get_chroma_client(persist_path=persist_path)
+        client = get_chroma_client()
         collection = client.get_collection("metadata_test")
 
         # Get all documents
@@ -208,3 +208,62 @@ class TestIngestDirectory:
         assert len(simple_docs) > 0
         assert simple_docs[0]["title"] == "Simple Post"
         assert "test" in simple_docs[0]["tags"]
+
+    def test_all_frontmatter_fields_stored(self, tmp_path, monkeypatch):
+        """Test that all frontmatter fields (id, type, author, url) are stored."""
+        from chroma_client import get_chroma_client
+
+        persist_path = str(tmp_path / ".chromadb")
+        monkeypatch.setenv("CHROMA_PERSIST_PATH", persist_path)
+        ingest_directory(
+            FIXTURES_DIR,
+            collection_name="frontmatter_test",
+        )
+
+        client = get_chroma_client()
+        collection = client.get_collection("frontmatter_test")
+
+        all_docs = collection.get(include=["metadatas"])
+
+        # Find document from full_frontmatter.md
+        full_docs = [
+            m for m in all_docs["metadatas"] if m["source_file"] == "full_frontmatter.md"
+        ]
+        assert len(full_docs) > 0
+        meta = full_docs[0]
+        assert meta["id"] == "2024-01-15_test-article"
+        assert meta["type"] == "deep_dive"
+        assert meta["author"] == "Test Author"
+        assert meta["url"] == "https://example.com/test-article"
+
+    def test_no_chunk_option(self, tmp_path, monkeypatch):
+        """Test that no_chunk=True ingests entire document as single chunk."""
+        from chroma_client import get_chroma_client
+
+        persist_path = str(tmp_path / ".chromadb")
+        monkeypatch.setenv("CHROMA_PERSIST_PATH", persist_path)
+        ingest_directory(
+            FIXTURES_DIR,
+            collection_name="no_chunk_test",
+            no_chunk=True,
+        )
+
+        client = get_chroma_client()
+        collection = client.get_collection("no_chunk_test")
+
+        all_docs = collection.get(include=["metadatas"])
+
+        # Each file with content should have exactly 1 chunk
+        simple_docs = [
+            m for m in all_docs["metadatas"] if m["source_file"] == "simple.md"
+        ]
+        assert len(simple_docs) == 1
+        assert simple_docs[0]["total_chunks"] == 1
+
+
+class TestChromaClient:
+    def test_invalid_client_type_raises_error(self):
+        from chroma_client import get_chroma_client
+
+        with pytest.raises(ValueError, match="Unknown client type"):
+            get_chroma_client(client_type="invalid")

@@ -14,8 +14,14 @@ wheels/
 # ChromaDB
 .chromadb
 
+# Environment variables (keep dist.env as template)
+.env
+
 # MacOS
 .DS_Store
 
 # articles
 /articles/
+
+# Chat logs
+chat.log
